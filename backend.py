@@ -1,14 +1,14 @@
 """Python fastapi backend"""
 
-import os
 from pathlib import Path
 import uvicorn
-import boto3
-from botocore.exceptions import ClientError
-from fastapi import FastAPI, File, UploadFile, Response, HTTPException
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from pydantic import BaseModel
 
 
 app = FastAPI()
@@ -22,18 +22,96 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+# SQLite database setup
+SQLALCHEMY_DATABASE_URL = "sqlite:///./regolith.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Define your data model
+class Item(Base):
+    __tablename__ = "items"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    description = Column(String)
+
+# Create the database tables
+Base.metadata.create_all(bind=engine)
+
+# Pydantic model for item creation and update
+class ItemCreate(BaseModel):
+    name: str
+    description: str
+
+class ItemUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+
+# Dependency to get the database session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# API endpoints
+@app.post("/items")
+def create_item(item: ItemCreate, db: Session = Depends(get_db)):
+    db_item = Item(**item.dict())
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+@app.get("/items/{item_id}")
+def read_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(Item).filter(Item.id == item_id).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return item
+
+@app.get("/items")
+def read_items(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    items = db.query(Item).offset(skip).limit(limit).all()
+    return items
+
+@app.put("/items/{item_id}")
+def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db)):
+    db_item = db.query(Item).filter(Item.id == item_id).first()
+    if db_item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    update_data = item.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_item, key, value)
+    
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+@app.delete("/items/{item_id}")
+def delete_item(item_id: int, db: Session = Depends(get_db)):
+    db_item = db.query(Item).filter(Item.id == item_id).first()
+    if db_item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    db.delete(db_item)
+    db.commit()
+    return {"message": "Item deleted successfully"}
+
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
-    favicon_path = Path("favicon.ico")
+    favicon_path = Path("media", "favicon.ico")
     if not favicon_path.is_file():
-        return {"error": "Image not found on the server"}
+        raise HTTPException(status_code=404, detail="Item not found")
     return FileResponse(favicon_path)
 
-@app.get("/image/test")
-async def get_image():
-    image_path = Path("test.png")
+@app.get("/image/{image_name}")
+async def get_image(image_name: str):
+    image_path = Path("media", f"{image_name}.png")
     if not image_path.is_file():
-        return {"error": "Image not found on the server"}
+        raise HTTPException(status_code=404, detail="Item not found")
     return FileResponse(image_path)
 
 if __name__ == "__main__":
