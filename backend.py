@@ -2,13 +2,14 @@
 
 from pathlib import Path
 import uvicorn
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
+from typing import List
 
 
 app = FastAPI()
@@ -47,6 +48,24 @@ class ItemUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
 
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            await connection.send_text(message)
+
+manager = ConnectionManager()
+
 # Dependency to get the database session
 def get_db():
     db = SessionLocal()
@@ -57,11 +76,12 @@ def get_db():
 
 # API endpoints
 @app.post("/items")
-def create_item(item: ItemCreate, db: Session = Depends(get_db)):
+async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
     db_item = Item(**item.dict())
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
+    await manager.broadcast("update")
     return db_item
 
 @app.get("/items/{item_id}")
@@ -77,7 +97,7 @@ def read_items(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
     return items
 
 @app.put("/items/{item_id}")
-def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db)):
+async def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db)):
     db_item = db.query(Item).filter(Item.id == item_id).first()
     if db_item is None:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -88,17 +108,29 @@ def update_item(item_id: int, item: ItemUpdate, db: Session = Depends(get_db)):
     
     db.commit()
     db.refresh(db_item)
+    await manager.broadcast("update")
     return db_item
 
 @app.delete("/items/{item_id}")
-def delete_item(item_id: int, db: Session = Depends(get_db)):
+async def delete_item(item_id: int, db: Session = Depends(get_db)):
     db_item = db.query(Item).filter(Item.id == item_id).first()
     if db_item is None:
         raise HTTPException(status_code=404, detail="Item not found")
     
     db.delete(db_item)
     db.commit()
+    await manager.broadcast("update")
     return {"message": "Item deleted successfully"}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            await manager.broadcast(f"Client says: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
