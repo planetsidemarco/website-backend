@@ -5,12 +5,12 @@ import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel
 from typing import List
-
+from datetime import datetime
 
 app = FastAPI()
 
@@ -29,17 +29,33 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Define your data model
+# Define your data models
 class Item(Base):
     __tablename__ = "items"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
     description = Column(String)
 
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"))
+    recipient_id = Column(Integer, ForeignKey("users.id"))
+    content = Column(String)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+    sender = relationship("User", foreign_keys=[sender_id])
+    recipient = relationship("User", foreign_keys=[recipient_id])
+
 # Create the database tables
 Base.metadata.create_all(bind=engine)
 
-# Pydantic model for item creation and update
+# Pydantic models for request/response
 class ItemCreate(BaseModel):
     name: str
     description: str
@@ -47,6 +63,24 @@ class ItemCreate(BaseModel):
 class ItemUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+
+class UserCreate(BaseModel):
+    name: str
+
+class MessageCreate(BaseModel):
+    sender_id: int
+    recipient_id: int
+    content: str
+
+class MessageResponse(BaseModel):
+    id: int
+    sender_id: int
+    recipient_id: int
+    content: str
+    timestamp: datetime
+
+    class Config:
+        orm_mode = True
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -74,7 +108,7 @@ def get_db():
     finally:
         db.close()
 
-# API endpoints
+# API endpoints for items (unchanged)
 @app.post("/items")
 async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
     db_item = Item(**item.dict())
@@ -122,6 +156,52 @@ async def delete_item(item_id: int, db: Session = Depends(get_db)):
     await manager.broadcast("update")
     return {"message": "Item deleted successfully"}
 
+# New API endpoints for users and messages
+@app.post("/users")
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = User(**user.dict())
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: int, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.id == user_id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    db_messages = db.query(Message).filter(Message.sender_id == user_id)
+    for message in db_messages:
+        db.delete(message)
+    
+    db.delete(db_user)
+    db.commit()
+    await manager.broadcast("update")
+    return {"message": "User deleted successfully"}
+
+@app.get("/users")
+def read_users(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    users = db.query(User).offset(skip).limit(limit).all()
+    return users
+
+@app.post("/messages", response_model=MessageResponse)
+async def create_message(message: MessageCreate, db: Session = Depends(get_db)):
+    db_message = Message(**message.dict())
+    db.add(db_message)
+    db.commit()
+    db.refresh(db_message)
+    await manager.broadcast("update")
+    return db_message
+
+@app.get("/messages")
+def read_messages(user_id: int, db: Session = Depends(get_db)):
+    messages = db.query(Message).filter(
+        (Message.sender_id == user_id) | (Message.recipient_id == user_id)
+    ).order_by(Message.timestamp).all()
+    return messages
+
+# WebSocket endpoint (unchanged)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
@@ -132,6 +212,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
+# File serving endpoints (unchanged)
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
     favicon_path = Path("media", "favicon.ico")
