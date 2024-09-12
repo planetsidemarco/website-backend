@@ -68,13 +68,12 @@ class UserCreate(BaseModel):
 
 class MessageCreate(BaseModel):
     sender_id: int
-    recipient_id: int
     content: str
 
 class MessageResponse(BaseModel):
     id: int
     sender_id: int
-    recipient_id: int
+    sender_name: str
     content: str
     timestamp: datetime
 
@@ -170,13 +169,10 @@ async def delete_user(user_id: int, db: Session = Depends(get_db)):
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
     
-    db_messages = db.query(Message).filter(Message.sender_id == user_id)
-    for message in db_messages:
-        db.delete(message)
-    
+    db.query(Message).filter((Message.sender_id == user_id) | (Message.recipient_id == user_id)).delete()
     db.delete(db_user)
     db.commit()
-    await manager.broadcast("update")
+    await manager.broadcast("user_deleted")
     return {"message": "User deleted successfully"}
 
 @app.get("/users")
@@ -186,19 +182,39 @@ def read_users(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
 
 @app.post("/messages", response_model=MessageResponse)
 async def create_message(message: MessageCreate, db: Session = Depends(get_db)):
-    db_message = Message(**message.dict())
+    sender = db.query(User).filter(User.id == message.sender_id).first()
+    if not sender:
+        raise HTTPException(status_code=404, detail="Sender not found")
+    
+    db_message = Message(sender_id=message.sender_id, content=message.content)
     db.add(db_message)
     db.commit()
     db.refresh(db_message)
+    
+    response = MessageResponse(
+        id=db_message.id,
+        sender_id=db_message.sender_id,
+        sender_name=sender.name,
+        content=db_message.content,
+        timestamp=db_message.timestamp
+    )
+    
     await manager.broadcast("update")
-    return db_message
+    return response
 
-@app.get("/messages")
-def read_messages(user_id: int, db: Session = Depends(get_db)):
-    messages = db.query(Message).filter(
-        (Message.sender_id == user_id) | (Message.recipient_id == user_id)
-    ).order_by(Message.timestamp).all()
-    return messages
+@app.get("/messages", response_model=List[MessageResponse])
+def read_messages(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    messages = db.query(Message).order_by(Message.timestamp).offset(skip).limit(limit).all()
+    return [
+        MessageResponse(
+            id=message.id,
+            sender_id=message.sender_id,
+            sender_name=message.sender.name,
+            content=message.content,
+            timestamp=message.timestamp
+        )
+        for message in messages
+    ]
 
 # WebSocket endpoint (unchanged)
 @app.websocket("/ws")
