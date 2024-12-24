@@ -6,6 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: website_backend_container
+    restart: always
     ports:
       - "8000:8000"
     volumes:
